@@ -13,4 +13,8 @@ Here is an example of a valid configuration:
 ---
 postlock_path: /usr/sbin/postlock
 brepop_path: /your/path/to/brepop.py
+pwfile: /etc/brepop/passwd
+logfile: /var/log/brepop.log
+spamlog: /var/log/brepopspam.log
+maildir: /var/mail
 ```
