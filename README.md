@@ -5,7 +5,7 @@ code is heavily reliant on living on a system with a Postfix-based e-mail server
 mailboxes and makes use of the `postlock` facility for mailbox locking.
 
 This code ~~doesn't do~~ now does socket/server/daemon handling, which can be enabled by way of the `-d` option.  Without
-this option, inetd/xinet or something similar is recommended for socket management.
+this option, inetd/xinetd or something similar is recommended for socket management.
 
 # Invocation
 
