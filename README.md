@@ -4,8 +4,9 @@ A minimized, simplified RFC1939 (POP3) implementation with customized authentica
 code is heavily reliant on living on a system with a Postfix-based e-mail server.  Specifically, it expects MBOX-style
 mailboxes and makes use of the `postlock` facility for mailbox locking.
 
-This code ~~doesn't do~~ now does socket/server/daemon handling, which can be enabled by way of the `-d` option.  Without
-this option, inetd/xinetd or something similar is recommended for socket management.
+This code ~~doesn't do~~ now does socket/server/daemon handling, which can be enabled by way of the `-d` option, although
+it should be considered an experimental feature.  Without this option, inetd/xinetd or something similar is recommended for
+socket management.
 
 # Invocation
 
