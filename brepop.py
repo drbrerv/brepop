@@ -3,13 +3,84 @@
 import sys
 import random
 import os
+import daemon
 import socket
+import socketserver
 import signal
 import time
 import crypt
 import yaml
+import json
 
 from re import match, search, I
+
+class ConfigImage:
+    def __init__( self, config_path=None ):
+        self.initerror = False
+        self.default_config = '/etc/brepop/config.yaml'
+        self.config_filepath_keys = [
+            'postlock_path',
+            'brepop_path',
+            'pwfile',
+            'logfile',
+            'spamlog'
+        ]
+        self.config_dir_keys = [
+            'maildir'
+        ]
+        self.config = self.build_config( config_path ) or {}
+        if not self.validate_config():
+            self.initerror = True
+            return
+
+    def build_config( self, filepath=None ):
+        ourdata = builtConfig = None
+        if filepath is None and self.default_config is None:
+            return None
+        elif filepath is not None:
+            if os.path.isfile( filepath ):
+                with open( filepath, 'r' ) as fpo:
+                    ourdata = fpo.read()
+        elif self.default_config is not None:
+            if os.path.isfile( self.default_config ):
+                with open( self.default_config, 'r' ) as dco:
+                    ourdata = dco.read()
+        try:
+            builtConfig = yaml.safe_load( ourdata )
+        except Exception:
+            return None
+        return builtConfig
+
+    def validate_config( self ):
+        rval = True
+        if self.config is None:
+            rval = False
+        else:
+            for item in self.config_filepath_keys:
+                if item in self.config:
+                    if not os.path.isfile( self.config[item] ):
+                        print( "ConfigValidationError item: " + \
+                                self.config[item] + \
+                                " is not a valid filepath" )
+                        rval = False
+                else:
+                    print("ConfigValidationError: " + item + " not set.")
+                    rval = False
+            for item in self.config_dir_keys:
+                if item in self.config:
+                    if not os.path.isdir( self.config[item] ):
+                        print( "ConfigValidationError item: " + \
+                                self.config[item] + \
+                                " is not a valid directory" )
+                        rval = False
+                else:
+                    print("ConfigValidationError: " + item + " not set.")
+                    rval = False
+            if 'bind_port' in self.config:
+                if type(self.config['bind_port']) == type(str()):
+                    bpint = int(self.config['bind_port'])
+                    self.config['bind_port'] = bpint
+        return rval
 
 class CodeDictMapper( object ):
     def __init__( self, *args, **kwargs ):
@@ -23,20 +94,17 @@ class CodeDictMapper( object ):
         return None
 
 class BrePopServer:
-    def __init__( self, config_path=None ):
-        self.default_config = '/etc/brepop/config.yaml'
-        self.config_param_keys = [
-            'postlock_path',
-            'brepop_path',
-            'pwfile',
-            'logfile',
-            'spamlog',
-            'maildir'
-        ]
+    def __init__( self, config_obj=None, inStream=None, outStream=None ):
         self.initerror = False
+        if config_obj is None:
+            ci = ConfigImage()
+            self.config = ci.config
+        else:
+            self.config = config_obj
         self.user = {}
         self.inbox = []
         self.mbox = ''
+        self.iline = ''
         self.state = 0
         self.lock = 0
         self.version = "1.0"
@@ -44,10 +112,6 @@ class BrePopServer:
         self.deleted = {}
         self.spam = []
         self.EOL = "\015\012"
-        self.config = self.build_config( config_path )
-        if not self.validate_config():
-            self.initerror = True
-            return
         self.options = {'welcome': 'Welcome to brepop.  Some stuff may be jacked up', 'timeout': 600, 'linetimeout': 600}
         self.spamlog = self.config['spamlog']
         random.seed( os.getpid() )
@@ -72,42 +136,34 @@ class BrePopServer:
             '^RSET': self.handle_reset,
             '^CAPA': self.handle_capa
         }
+        if inStream is not None:
+            self.reader = inStream
+        else:
+            self.reader = sys.stdin
+        if outStream is not None:
+            self.writer = outStream
+        else:
+            self.writer = sys.stdout
         self.NoAuthObject = CodeDictMapper( self.code_map_noauth )
         self.AuthObject = CodeDictMapper( self.code_map_auth )
         self.logger('Server initialization complete')
 
-    def build_config( self, filepath=None ):
-        ourdata = builtConfig = None
-        if filepath is None and self.default_config is None:
-            return None
-        elif filepath is not None:
-            if os.path.isfile( filepath ):
-                with open( filepath, 'r' ) as fpo:
-                    ourdata = fpo.read()
-        elif self.default_config is not None:
-            if os.path.isfile( self.default_config ):
-                with open( self.default_config, 'r' ) as dco:
-                    ourdata = dco.read()
-        try:
-            builtConfig = yaml.safe_load( ourdata )
-        except Exception:
-            return None
-        return builtConfig
+    def write_abstractor( self, msg ):
+        if isinstance( self.writer, socket.SocketType ):
+            self.writer.send( bytes(msg, 'utf-8' ) )
+        else:
+            self.writer.write( msg )
+            self.writer.flush()
 
-    def validate_config( self ):
-        # right now we have some file paths to check, which is easy enough
-        rval = True
-        for item in self.config_param_keys:
-            if item in self.config:
-                if not os.path.isfile( self.config[item] ):
-                    print( "ConfigValidationError item: " + \
-                            self.config[item] + \
-                            " is not a valid filepath" )
-                    rval = False
-            else:
-                print("ConfigValidationError: " + item + " not set.")
-                rval = False
-            return rval
+    def read_abstractor( self ):
+        if isinstance( self.reader, socket.SocketType ):
+            self.iline = self.reader.makefile().readline()
+        else:
+            self.iline = self.reader.readline()
+        if len( self.iline ) > 0 :
+            return True
+        else:
+            return False
 
     def logger( self, msg ):
         pid = os.getpid()
@@ -259,25 +315,25 @@ class BrePopServer:
     # Handler functions.  Start with common between "unauthenticated" and authenticated sessions
 
     def handle_version( self, mob ):
-            sys.stdout.write('+OK brepop ' + self.version + self.EOL )
+            self.write_abstractor('+OK brepop ' + self.version + self.EOL )
 
     def handle_capa( self, mob ):
-        sys.stdout.write( self.capabilities( self.state ) )
+        self.write_abstractor( self.capabilities( self.state ) )
 
     # End common handler functions
 
     # Handler functions for unauthenticated sessions:
 
     def handle_quit_noauth( self, mob ):
-            sys.stdout.write('+OK Bye, closing connection...' + self.EOL)
-            sys.stdin.close()
+            self.write_abstractor('+OK Bye, closing connection...' + self.EOL)
+            self.reader.close()
             self.logger( 'Closing session for unauthenticated user' )
             return 'QUIT'
 
     def handle_user( self, mob ):
             self.user['name'] = mob.group( 1 )
             self.user['pass'] = ''
-            sys.stdout.write('+OK ' + self.user['name'] + ' selected' + self.EOL )
+            self.write_abstractor('+OK ' + self.user['name'] + ' selected' + self.EOL )
 
     def handle_pass( self, mob ):
         self.user['pass'] = mob.group( 1 )
@@ -288,19 +344,19 @@ class BrePopServer:
                 self.brepopList( self.user['name'] )
                 ct = len( self.message )
                 bsize = self.boxsize( self.message )
-                sys.stdout.write('+OK ' + self.user['name'] + "'s maildrop has " + \
+                self.write_abstractor('+OK ' + self.user['name'] + "'s maildrop has " + \
                         str(ct) + ' messages (' + str(bsize) + ' octets)' + self.EOL)
             else:
                 self.user['name'] = ''
-                sys.stdout.write('-ERR Unable to lock maildrop at this time with that auth info' + self.EOL)
+                self.write_abstractor('-ERR Unable to lock maildrop at this time with that auth info' + self.EOL)
         else:
-            sys.stdout.write('-ERR You can only use PASS right after USER' + self.EOL)
+            self.write_abstractor('-ERR You can only use PASS right after USER' + self.EOL)
 
     def handle_apop( self, mob ):
-        sys.stdout.write('-ERR APOP authentication not yet implemented, try USER/PASS' + self.EOL)
+        self.write_abstractor('-ERR APOP authentication not yet implemented, try USER/PASS' + self.EOL)
 
     def handle_default_noauth( self, mob ):
-        sys.stdout.write('-ERR That must be something I have not implemented yet, or you need to authenticate.' + self.EOL)
+        self.write_abstractor('-ERR That must be something I have not implemented yet, or you need to authenticate.' + self.EOL)
 
     # End handler functions for unauthenticated sessions
 
@@ -309,26 +365,26 @@ class BrePopServer:
     def handle_stat( self, mob ):
         ct = len( self.message )
         bsize = self.boxsize( self.message )
-        sys.stdout.write("+OK " + str(ct) + " " + str(bsize) + self.EOL)
+        self.write_abstractor("+OK " + str(ct) + " " + str(bsize) + self.EOL)
 
     def handle_list( self, mob ):
         mnum = mob.group( 1 )
         if mnum:
             if int( mnum ) <= len(self.message):
                 slist = self.scanlisting( mnum )
-                sys.stdout.write('+OK ' + slist + self.EOL )
+                self.write_abstractor('+OK ' + slist + self.EOL )
             else:
                 ct = len( self.message )
-                sys.stdout.write('-ERR Cannot find message ' + mnum + ' (only ' + ct + ' in drop)' + self.EOL)
+                self.write_abstractor('-ERR Cannot find message ' + mnum + ' (only ' + ct + ' in drop)' + self.EOL)
         else:
             mnum = 1
-            sys.stdout.write('+OK scan listing follows' + self.EOL)
+            self.write_abstractor('+OK scan listing follows' + self.EOL)
             for mdict in self.inbox:
                 for mid, mtext in mdict.items():
                     if not mid in self.deleted:
-                        sys.stdout.write( str(mnum) + ' ' + str(len(mtext)) + self.EOL)
+                        self.write_abstractor( str(mnum) + ' ' + str(len(mtext)) + self.EOL)
                 mnum += 1
-            sys.stdout.write('.' + self.EOL)
+            self.write_abstractor('.' + self.EOL)
 
     def handle_uidl( self, mob ):
         mnum = 0
@@ -336,25 +392,25 @@ class BrePopServer:
             mnum = int( mob.group( 1 ) )
         if mnum:
             if mnum <= len(self.message):
-                sys.stdout.write('+OK' + str(mnum) + ' ' + self.message[mnum-1] + self.EOL)
+                self.write_abstractor('+OK' + str(mnum) + ' ' + self.message[mnum-1] + self.EOL)
             else:
                 ct = len( self.message )
-                sys.stdout.write('-ERR Cannot find message $msgnum (only ' + str(ct) + ' in drop)' + self.EOL)
+                self.write_abstractor('-ERR Cannot find message $msgnum (only ' + str(ct) + ' in drop)' + self.EOL)
         else:
             mnum = 1
-            sys.stdout.write('+OK message-id listing follows' + self.EOL)
+            self.write_abstractor('+OK message-id listing follows' + self.EOL)
             for mid in self.message:
                 if not mid in self.deleted:
-                    sys.stdout.write( str(mnum) + ' ' + str(mid) + self.EOL)
+                    self.write_abstractor( str(mnum) + ' ' + str(mid) + self.EOL)
                     mnum += 1
-            sys.stdout.write('.' + self.EOL)
+            self.write_abstractor('.' + self.EOL)
 
     def handle_top( self, mob ):
         (mnum, lct) = int( mob.group( 1, 2 ) )
         (headers, body) = self.brepopRetrieve( self.message[mnum - 1] ).split("\n\n", 2)
         hlen = len(headers)
         blen = len(body)
-        sys.stdout.write('+OK top of message follows (' + hlen + ' octets in head and ' + blen +\
+        self.write_abstractor('+OK top of message follows (' + hlen + ' octets in head and ' + blen +\
                 ' octets in body up to ' + lct + ' lines)' + self.EOL)
         lnum = 0
         for headln in headers.split("\n"):
@@ -363,13 +419,13 @@ class BrePopServer:
                 per = '.'
             lnum += 1
             if lnum <= lct:
-                sys.stdout.write(per + headln + self.EOL)
-        sys.stdout.write('.' + self.EOL)
+                self.write_abstractor(per + headln + self.EOL)
+        self.write_abstractor('.' + self.EOL)
 
     def handle_retr( self, mob ):
         mnum = int( mob.group( 1 ) )
         if mnum <= len( self.message ):
-            sys.stdout.write('+OK sending ' + str(mnum) + self.EOL)
+            self.write_abstractor('+OK sending ' + str(mnum) + self.EOL)
             mid = self.message[mnum - 1]
             msg = self.brepopRetrieve( mid )
             if not search("\n\n", msg):
@@ -378,34 +434,34 @@ class BrePopServer:
                 per = ''
                 if match('^\.', msgline):
                     per = '.'
-                sys.stdout.write(per + msgline + self.EOL)
-            sys.stdout.write('.' + self.EOL)
+                self.write_abstractor(per + msgline + self.EOL)
+            self.write_abstractor('.' + self.EOL)
         else:
             ct = len( self.message )
-            sys.stdout.write('-ERR Cannot find message ' + str(mnum) + ' (only ' + str(ct) + ' in drop)' + self.EOL)
+            self.write_abstractor('-ERR Cannot find message ' + str(mnum) + ' (only ' + str(ct) + ' in drop)' + self.EOL)
 
     def handle_dele( self, mob ):
         mnum = int( mob.group( 1 ) )
         if mnum <= len(self.message):
             self.deleted[self.message[mnum - 1]] = 1
-            sys.stdout.write('+OK marking message number ' + str(mnum) + ' for later deletion' + self.EOL)
+            self.write_abstractor('+OK marking message number ' + str(mnum) + ' for later deletion' + self.EOL)
         else:
             ct = len(self.message)
-            sys.stdout.write('-ERR Cannot find message ' + str(mnum) + ' (only ' + ct + ' in drop)' + self.EOL)
+            self.write_abstractor('-ERR Cannot find message ' + str(mnum) + ' (only ' + ct + ' in drop)' + self.EOL)
 
     def handle_noop( self, mob ):
-        sys.stdout.write('+OK nothing to do.' + self.EOL)
+        self.write_abstractor('+OK nothing to do.' + self.EOL)
 
     def handle_reset( self, mob ):
         self.deleted = {}
-        sys.stdout.write('+OK now no messages are marked for deletion at end of session.' + self.EOL )
+        self.write_abstractor('+OK now no messages are marked for deletion at end of session.' + self.EOL )
 
     def handle_default_auth( self, mob ):
-        sys.stdout.write('-ERR That must be something I have not implemented yet.' + self.EOL)
+        self.write_abstractor('-ERR That must be something I have not implemented yet.' + self.EOL)
 
     def handle_quit_auth( self, mob ):
         self.brepopDelete( self.user['name'] )
-        sys.stdout.write('+OK Bye, closing connection...' + self.EOL)
+        self.write_abstractor('+OK Bye, closing connection...' + self.EOL)
         self.logger('Closing session for user: ' + self.user['name'] )
         return 'QUIT'
 
@@ -416,9 +472,9 @@ class BrePopServer:
     def handle_session( self ):
         mapObjectPtr = self.NoAuthObject
         defaultHandlerPtr = self.handle_default_noauth
-        sys.stdout.write('+OK ' + self.options['welcome'] + self.EOL )
-        sys.stdout.flush()
-        for iline in sys.stdin:
+        self.write_abstractor('+OK ' + self.options['welcome'] + self.EOL )
+        # for iline in self.reader:
+        while self.read_abstractor():
             matched = 0
             if self.state == 1:
                 mapObjectPtr = self.AuthObject
@@ -426,13 +482,12 @@ class BrePopServer:
             else:
                 mapObjectPtr = self.NoAuthObject
                 defaultHandlerPtr = self.handle_default_noauth
-            mhret = mapObjectPtr.mapHandler( iline )
+            mhret = mapObjectPtr.mapHandler( self.iline )
             if mhret is not None:
                 if mhret[0]( mhret[1] ) == 'QUIT':
-                    return 1
+                    break
             else:
                 defaultHandlerPtr( mhret )
-            sys.stdout.flush()
         self.logger('Client closed connection for user: ' + self.user['name'] )
         return 1
 
@@ -440,7 +495,6 @@ class BrePopServer:
 
 class LockingChild:
     def __init__( self, servport ):
-        # print('connecting to port: ' + servport )
         mypid = str( os.getpid() )
         try:
             client = socket.create_connection( ('127.0.0.1', int(servport)) )
@@ -449,27 +503,55 @@ class LockingChild:
         client.send( bytes( mypid, 'UTF-8') )
         time.sleep( 300 )
 
+class SocketHandler( socketserver.BaseRequestHandler ):
+    def handle( self ):
+        self.serverInstance = BrePopServer( None, self.request, self.request )
+        self.serverInstance.handle_session()
+
 ###########################
 # Main deal
 #
-# Usage: brepop.py [-p|path_to_config_file]
+# Usage: brepop.py [-d|-p port] [path_to_config_file]
 #
 ###########################
 
 conf_path = None
+lockingChild = daemonize = False
 if len( sys.argv ) > 1:
     pt = 0
-    if sys.argv[1] == '-p':
-        pt = sys.argv[2]
-        mycli = LockingChild( pt )
-        sys.exit( 0 )
-    else:
-        for arg in sys.argv:
-            if os.path.isfile( arg ):
-                conf_path = arg
-                break
+    for num, arg in enumerate( sys.argv[1:], 1 ):
+        if os.path.isfile( arg ):
+            conf_path = arg
+        elif arg == '-p':
+            pt = sys.argv[num + 1]
+            lockingChild = True
+        elif arg == '-d':
+            daemonize = True
+        else:
+            print("USAGE: " + sys.argv[0] + " [-d|-p port] [path_to_config_file]")
+            sys.exit( 1 )
+if lockingChild:
+    # LockingChild doesn't consume config (yet)
+    mycli = LockingChild( pt )
+    sys.exit( 0 )
+cimg = ConfigImage( conf_path )
+if cimg.initerror:
+    sys.exit( 1 )
 else:
-    servinst = BrePopServer( conf_path )
+    confimg = cimg.config
+if daemonize:
+    with daemon.DaemonContext():
+        try:
+            ssObj = socketserver.TCPServer( (confimg['bind_address'], confimg['bind_port']), SocketHandler )
+        except KeyError:
+            print("Unable to create socket sever with config: " + json.dumps(confimg) )
+            sys.exit( 1 )
+        except Exception as e:
+            print("Unable to create socket server for unknown error, but check out your config: " + str(e)  + " config: " + json.dumps(confimg) )
+            sys.exit( 1 )
+        ssObj.serve_forever()
+else:
+    servinst = BrePopServer( confimg )
     if not servinst.initerror:
         servinst.handle_session()
         sys.exit( 0 )
